@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
 
-set -exuo pipefail
+set -euo pipefail
 
 function _ssh() {
     ssh -n "$@" | sed s/.$//
