@@ -1,7 +1,7 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration#add-on-config
 
 name: Miktotik Backup
-version: "1.1.1"
+version: "1.1.2"
 slug: mikrotik-backup
 description: Dump config of your Mikrotik devices to git repo
 arch:
@@ -16,8 +16,8 @@ options:
   ssh_pri_key: -----BEGIN OPENSSH PRIVATE KEY-----...
   git_repo: git@github.com:username/repo.git
   ssh_host_args:
-  - username@hostname
-  - -p 1234 root@192.168.0.1
+    - username@hostname
+    - -p 1234 root@192.168.0.1
   skip_host_key_checking: false
   include_sensitive: false
 schema:
@@ -25,6 +25,6 @@ schema:
   ssh_pri_key: str?
   git_repo: str?
   ssh_host_args:
-  - str
+    - str
   skip_host_key_checking: bool
   include_sensitive: bool

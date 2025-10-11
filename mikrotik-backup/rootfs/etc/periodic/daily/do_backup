@@ -24,7 +24,11 @@ while read -r host_args; do
   bashio::log.info "SSH: $host_args"
 
   # shellcheck disable=SC2086
-  ident="$(_ssh $host_args 'put [/system identity print as-value]')"
+  ident="$(_ssh $host_args 'put [/system identity print as-value]' || true)"
+  if [[ -z "$ident" ]]; then
+      bashio::log.warning "Failed to connect"
+      continue
+  fi
   if [[ ! "$ident" =~ ^name=(.*)$ ]]; then
       bashio::log.warning "Invalid identity output: '$ident'"
       continue
