@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
 
-set -euo pipefail
+set -exuo pipefail
 
 function _ssh() {
     ssh -n "$@" | sed s/.$//
@@ -20,14 +20,14 @@ fi
 
 ssh_host_args="$(bashio::config ssh_host_args)"
 
-echo "$ssh_host_args" | while read -r host_args; do
+while read -r host_args; do
   bashio::log.info "SSH: $host_args"
 
   # shellcheck disable=SC2086
   ident="$(_ssh $host_args 'put [/system identity print as-value]')"
   if [[ ! "$ident" =~ ^name=(.*)$ ]]; then
-      echo "Invalid identity output: '$ident'" >&2
-      exit 1
+      bashio::log.warning "Invalid identity output: '$ident'"
+      continue
   fi
   ident="${BASH_REMATCH[1]}"
 
@@ -38,7 +38,7 @@ echo "$ssh_host_args" | while read -r host_args; do
 
   git -C "/data/repo" add "/data/repo/mikrotik/$ident.rsc"
   git -C "/data/repo" commit --message="Mikrotik backup: $ident" || true
-done
+done <<< "$ssh_host_args"
 
 bashio::log.info "Pushing repo..."
 git -C "/data/repo" push
