@@ -2,6 +2,26 @@
 
 _Control cameras connected to Dahua NVR._
 
+Camera switches distinguish a deliberate **OFF** from an unavailable camera.
+If an enabled camera loses its NVR connection, its Home Assistant switch becomes
+unavailable and cannot be toggled. An unavailable camera also ignores MQTT commands.
+
+The add-on deliberately disables cameras by appending `_OFF_` to their NVR
+username. These cameras remain available to turn back on while any of their
+configured HTTP, Dahua, HTTPS or RTSP ports is reachable. This is a TCP reachability
+check, not an authentication or video-stream check. Disconnected cameras recover
+automatically on the next poll (60 seconds by default).
+
+MQTT discovery, state and availability are retained. Loss of the add-on's MQTT
+connection or a failed NVR poll makes all camera switches unavailable until the
+connection and polling recover.
+
+Run the availability tests with the dependencies from `rootfs/usr/src/requirements.txt`:
+
+```sh
+python -m unittest discover -s dahua-nvr/tests -v
+```
+
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
 ![Supports armhf Architecture][armhf-shield]
