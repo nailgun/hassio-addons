@@ -41,7 +41,7 @@ class DahuaDevice:
         if self.session_id:
             body['session'] = self.session_id
 
-        resp = requests.post(uri, data=json.dumps(body), headers=headers)
+        resp = requests.post(uri, data=json.dumps(body), headers=headers, timeout=(5, 15))
         resp.raise_for_status()
         resp_body = resp.json()
         self.session_id = resp_body.get('session')

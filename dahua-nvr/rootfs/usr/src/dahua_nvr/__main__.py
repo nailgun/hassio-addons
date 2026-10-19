@@ -4,6 +4,7 @@ import json
 import logging
 import argparse
 import threading
+import socket
 from collections import OrderedDict
 
 import paho.mqtt.client as mqtt
@@ -19,6 +20,7 @@ DISCOVERY_PREFIX = 'homeassistant'
 NODE_ID = 'dahua_nvr'
 SET_RE = re.compile(rf'{DISCOVERY_PREFIX}/switch/{NODE_ID}/cam(\d+)/set')
 OFF_SUFFIX = '_OFF_'
+AVAILABILITY_TOPIC = f'{DISCOVERY_PREFIX}/{NODE_ID}/availability'
 DEVICE_INFO = {
     'identifiers': [
         'dahua_nvr',
@@ -33,6 +35,27 @@ device_lock = threading.Lock()
 mqtt_lock = threading.Lock()
 
 
+def camera_reachable(cam):
+    """Check a deliberately disabled camera without changing its NVR credentials."""
+    info = cam['DeviceInfo']
+    # ONVIF cameras can have a placeholder Dahua service port, while HTTP works.
+    ports = []
+    for field in ('HttpPort', 'Port', 'HttpsPort', 'RtspPort'):
+        try:
+            port = int(info.get(field, 0))
+        except (TypeError, ValueError):
+            continue
+        if 0 < port <= 65535 and port not in ports:
+            ports.append(port)
+    for port in ports:
+        try:
+            with socket.create_connection((info['Address'], port), timeout=2):
+                return True
+        except (OSError, KeyError):
+            continue
+    return False
+
+
 def read_state(device: DahuaDevice):
     with device_lock:
         cameras = device.secure_request('LogicDeviceManager.secGetCameraAll', None)['params']['camera']
@@ -41,15 +64,17 @@ def read_state(device: DahuaDevice):
 
     with device_lock:
         states = device.request('LogicDeviceManager.getCameraState', {'uniqueChannels': [-1]})['params']['states']
-    for s in states:
-        cam = cameras_dict.get(s['channel'])
-        if cam:
-            cam['_state'] = s['connectionState'] == 'Connected'
+    connected = {s['channel'] for s in states if s['connectionState'] == 'Connected'}
 
     for cam in cameras_dict.values():
         channel0 = cam['UniqueChannel']
         channel1 = channel0 + 1
         cam['_name'] = f'cam{channel1}'
+        # OFF is a deliberate credential change, not a loss of connectivity.
+        cam['_state'] = not cam['DeviceInfo']['UserName'].endswith(OFF_SUFFIX)
+        cam['_available'] = channel0 in connected or (
+            not cam['_state'] and camera_reachable(cam)
+        )
 
     # import pprint
     # pprint.pprint(cameras)
@@ -72,7 +97,12 @@ def publish_config(client: mqtt.Client, state):
             'name': cam_name.upper(),
             'command_topic': f'{mqtt_prefix}/set',
             'state_topic': f'{mqtt_prefix}/state',
-            'device': DEVICE_INFO,
+            'availability': [
+                {'topic': AVAILABILITY_TOPIC},
+                {'topic': f'{mqtt_prefix}/availability'},
+            ],
+            'availability_mode': 'all',
+            'device': dict(DEVICE_INFO),
             'icon': 'mdi:video',
         }
 
@@ -80,7 +110,7 @@ def publish_config(client: mqtt.Client, state):
             entity_config['device']['configuration_url'] = f'http://{ip}/'
 
         with mqtt_lock:
-            client.publish(f'{mqtt_prefix}/config', json.dumps(entity_config), qos=1)
+            client.publish(f'{mqtt_prefix}/config', json.dumps(entity_config), qos=1, retain=True)
         log.info('%s config published', cam_name)
 
 
@@ -92,17 +122,28 @@ def publish_state(client: mqtt.Client, state):
         state_str = 'ON' if cam['_state'] else 'OFF'
 
         with mqtt_lock:
-            client.publish(f'{mqtt_prefix}/state', state_str, qos=1)
+            client.publish(f'{mqtt_prefix}/state', state_str, qos=1, retain=True)
+            client.publish(f'{mqtt_prefix}/availability',
+                           'online' if cam['_available'] else 'offline', qos=1, retain=True)
         log.info('%s state published', cam_name)
 
 
-def on_connect(client: mqtt.Client, device: DahuaDevice, flags, reason_code, properties):
-    state = read_state(device)
-    publish_config(client, state)
-    publish_state(client, state)
+def publish_availability(client, available):
+    with mqtt_lock:
+        client.publish(AVAILABILITY_TOPIC, 'online' if available else 'offline', qos=1, retain=True)
 
-    # Subscribing in on_connect() means that if we lose the connection and
-    # reconnect then subscriptions will be renewed.
+
+def on_connect(client: mqtt.Client, device: DahuaDevice, flags, reason_code, properties):
+    publish_availability(client, False)
+    try:
+        state = read_state(device)
+        publish_config(client, state)
+        publish_state(client, state)
+        publish_availability(client, True)
+    except Exception:
+        log.exception('Could not read initial NVR state; cameras remain unavailable')
+
+    # Renew subscriptions after every reconnect, including an initial NVR failure.
     with mqtt_lock:
         client.subscribe(f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/+/set')
 
@@ -126,8 +167,15 @@ def on_message(client: mqtt.Client, device: DahuaDevice, msg: mqtt.MQTTMessage):
     channel0 = channel1 - 1
 
     state = read_state(device)
-    cam = state[channel0]
+    cam = state.get(channel0)
+    if cam is None:
+        log.warning('Ignoring command for unknown channel %s', channel1)
+        return
     cam_name = cam['_name']
+    if not cam['_available']:
+        log.warning('Ignoring command for unavailable camera %s', cam_name)
+        publish_state(client, state)
+        return
 
     username = cam['DeviceInfo']['UserName']
     current_state = not username.endswith(OFF_SUFFIX)
@@ -146,7 +194,9 @@ def on_message(client: mqtt.Client, device: DahuaDevice, msg: mqtt.MQTTMessage):
     cam['DeviceInfo']['VideoInputChannels'] = None
 
     with device_lock:
-        device.secure_request('LogicDeviceManager.secSetCamera', {'cameras': [cam]})
+        device.secure_request('LogicDeviceManager.secSetCamera', {
+            'cameras': [{k: v for k, v in cam.items() if not k.startswith('_')}],
+        })
     if new_state:
         log.info('%s turned on', cam_name)
     else:
@@ -189,15 +239,17 @@ class UpdateThread(threading.Thread):
                 log.info('Refreshing state from NVR by timer')
 
             counter += 1
-            if self.client.is_connected:
+            if self.client.is_connected():
                 try:
                     state = read_state(self.device)
                     publish_state(self.client, state)
+                    publish_availability(self.client, True)
                     if counter % self.config_update_every == 0:
                         # refresh config every 10th update
                         log.info('Also refreshing device config')
                         publish_config(self.client, state)
                 except Exception:
+                    publish_availability(self.client, False)
                     log.exception('Got error while updating state')
 
 
@@ -224,6 +276,7 @@ def main():
 
     log.info('Connecting to MQTT server...')
     mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqttc.will_set(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
     with mqtt_lock:
         mqttc.user_data_set(device)
         mqttc.on_connect = on_connect
