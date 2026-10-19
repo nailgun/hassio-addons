@@ -43,6 +43,11 @@ if [ ! -d /data/repo ]; then
   mkdir -p /data/repo/mikrotik
 fi
 
+# Backup restore may strip executable bits from persistent data files.
+if [[ -f /data/repo/.git/hooks/pre-commit ]]; then
+  chmod +x /data/repo/.git/hooks/pre-commit
+fi
+
 /etc/periodic/daily/do_backup
 
 bashio::log.info "Running cron..."

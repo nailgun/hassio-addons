@@ -10,7 +10,7 @@ function _ssh() {
 cp /data/known_hosts ~/.ssh/known_hosts
 
 bashio::log.info "Pulling repo changes..."
-git -C "/data/repo" pull
+git -C "/data/repo" pull --no-rebase
 
 if bashio::config.true "include_sensitive"; then
   export_cmd="/export show-sensitive"
@@ -38,7 +38,18 @@ while read -r host_args; do
   bashio::log.info "  ident: $ident"
 
   # shellcheck disable=SC2086
-  _ssh $host_args $export_cmd | sed '1 s/#.* by/# by/' > "/data/repo/mikrotik/$ident.rsc" || true
+  export_file="$(mktemp)"
+  if ! _ssh $host_args $export_cmd | sed '1 s/#.* by/# by/' > "$export_file"; then
+    bashio::log.warning "Export failed for $ident; keeping previous configuration"
+    rm -f "$export_file"
+    continue
+  fi
+  if ! awk '/^[[:space:]]*\/[[:alnum:]_]/ { found=1 } END { exit !found }' "$export_file"; then
+    bashio::log.warning "Empty or header-only export for $ident; keeping previous configuration"
+    rm -f "$export_file"
+    continue
+  fi
+  mv "$export_file" "/data/repo/mikrotik/$ident.rsc"
 
   git -C "/data/repo" add "/data/repo/mikrotik/$ident.rsc"
   git -C "/data/repo" commit --message="Mikrotik backup: $ident" || true
