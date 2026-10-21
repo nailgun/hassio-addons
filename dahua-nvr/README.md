@@ -16,6 +16,17 @@ MQTT discovery, state and availability are retained. Loss of the add-on's MQTT
 connection or a failed NVR poll makes all camera switches unavailable until the
 connection and polling recover.
 
+Removed cameras and cameras with NVR `Enable=False` have their retained
+discovery, state and availability topics cleared on the next successful poll.
+This does not remove deliberately OFF or temporarily disconnected cameras.
+Discovery is republished on the first successful poll after an NVR failure,
+before bridge availability becomes online; unchanged discovery still refreshes
+at the configured interval.
+
+The published-camera inventory survives MQTT reconnects within the running
+add-on, but is not persisted across add-on restarts. Retained orphan topics
+from before this process started require manual cleanup.
+
 Run the availability tests with the dependencies from `rootfs/usr/src/requirements.txt`:
 
 ```sh

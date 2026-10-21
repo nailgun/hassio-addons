@@ -84,34 +84,46 @@ def read_state(device: DahuaDevice):
     return cameras_dict
 
 
-def publish_config(client: mqtt.Client, state):
-    for cam in state.values():
-        cam_name = cam['_name']
-        mqtt_prefix = f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/{cam_name}'
+def publish_config(client: mqtt.Client, state, force=True):
+    # Keep the inventory on the MQTT client so it survives broker reconnects.
+    # Serialize inventory reconciliation with discovery publications.
+    with mqtt_lock:
+        names = {cam['_name'] for cam in state.values()}
+        previous = vars(client).get('_discovery_cameras', set())
+        if not force and names == previous:
+            return
+        for cam_name in sorted(previous - names):
+            mqtt_prefix = f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/{cam_name}'
+            for suffix in ('config', 'state', 'availability'):
+                client.publish(f'{mqtt_prefix}/{suffix}', '', qos=1, retain=True)
+            log.info('%s retained topics cleared', cam_name)
+        for cam in state.values():
+            cam_name = cam['_name']
+            mqtt_prefix = f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/{cam_name}'
 
-        unique_id = f'{NODE_ID}_{cam_name}'
-        ip = cam['DeviceInfo']['Address']
+            unique_id = f'{NODE_ID}_{cam_name}'
+            ip = cam['DeviceInfo']['Address']
 
-        entity_config = {
-            'unique_id': unique_id,
-            'name': cam_name.upper(),
-            'command_topic': f'{mqtt_prefix}/set',
-            'state_topic': f'{mqtt_prefix}/state',
-            'availability': [
-                {'topic': AVAILABILITY_TOPIC},
-                {'topic': f'{mqtt_prefix}/availability'},
-            ],
-            'availability_mode': 'all',
-            'device': dict(DEVICE_INFO),
-            'icon': 'mdi:video',
-        }
+            entity_config = {
+                'unique_id': unique_id,
+                'name': cam_name.upper(),
+                'command_topic': f'{mqtt_prefix}/set',
+                'state_topic': f'{mqtt_prefix}/state',
+                'availability': [
+                    {'topic': AVAILABILITY_TOPIC},
+                    {'topic': f'{mqtt_prefix}/availability'},
+                ],
+                'availability_mode': 'all',
+                'device': dict(DEVICE_INFO),
+                'icon': 'mdi:video',
+            }
 
-        if ip:
-            entity_config['device']['configuration_url'] = f'http://{ip}/'
+            if ip:
+                entity_config['device']['configuration_url'] = f'http://{ip}/'
 
-        with mqtt_lock:
             client.publish(f'{mqtt_prefix}/config', json.dumps(entity_config), qos=1, retain=True)
-        log.info('%s config published', cam_name)
+            log.info('%s config published', cam_name)
+        client._discovery_cameras = names
 
 
 def publish_state(client: mqtt.Client, state):
@@ -228,6 +240,7 @@ class UpdateThread(threading.Thread):
 
     def run(self):
         counter = 0
+        recovering = True
 
         while True:
             if state_changed_event.wait(timeout=self.update_interval):
@@ -242,15 +255,20 @@ class UpdateThread(threading.Thread):
             if self.client.is_connected():
                 try:
                     state = read_state(self.device)
+                    # Reconcile camera changes every poll; refresh unchanged discovery
+                    # periodically and immediately after a failed read/reconnect.
+                    publish_config(self.client, state, force=(
+                        recovering or counter % self.config_update_every == 0
+                    ))
                     publish_state(self.client, state)
                     publish_availability(self.client, True)
-                    if counter % self.config_update_every == 0:
-                        # refresh config every 10th update
-                        log.info('Also refreshing device config')
-                        publish_config(self.client, state)
+                    recovering = False
                 except Exception:
+                    recovering = True
                     publish_availability(self.client, False)
                     log.exception('Got error while updating state')
+            else:
+                recovering = True
 
 
 def main():
