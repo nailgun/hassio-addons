@@ -14,24 +14,26 @@ automatically on the next poll (60 seconds by default).
 
 MQTT discovery, state and availability are retained. Loss of the add-on's MQTT
 connection or a failed NVR poll makes all camera switches unavailable until the
-connection and polling recover.
+connection and polling recover. The first successful poll after a failure
+refreshes discovery and state before marking the bridge online, without waiting
+for the periodic configuration refresh.
 
-Removed cameras and cameras with NVR `Enable=False` have their retained
-discovery, state and availability topics cleared on the next successful poll.
-This does not remove deliberately OFF or temporarily disconnected cameras.
-Discovery is republished on the first successful poll after an NVR failure,
-before bridge availability becomes online; unchanged discovery still refreshes
-at the configured interval.
+Cameras removed from the NVR or disabled with its `Enable` setting have their
+retained discovery, state and availability topics cleared on the next successful
+poll. A camera turned **OFF** by this add-on, or temporarily disconnected, keeps
+its discovery configuration. On MQTT reconnect, the add-on also reads its own
+retained camera topics to clean up obsolete entries from previous runs. Cleanup
+waits for a successful NVR read; a failed read never counts as an empty inventory.
 
-The published-camera inventory survives MQTT reconnects within the running
-add-on, but is not persisted across add-on restarts. Retained orphan topics
-from before this process started require manual cleanup.
-
-Run the availability tests with the dependencies from `rootfs/usr/src/requirements.txt`:
+Run the availability and discovery regression tests from the repository root:
 
 ```sh
+python -m pip install -r dahua-nvr/rootfs/usr/src/requirements.txt
 python -m unittest discover -s dahua-nvr/tests -v
 ```
+
+The tests use simulated NVR responses and MQTT publications; they do not connect
+to a broker or change real cameras.
 
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
