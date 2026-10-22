@@ -19,6 +19,9 @@ log = logging.getLogger('__name__')
 DISCOVERY_PREFIX = 'homeassistant'
 NODE_ID = 'dahua_nvr'
 SET_RE = re.compile(rf'{DISCOVERY_PREFIX}/switch/{NODE_ID}/cam(\d+)/set')
+CAMERA_TOPIC_RE = re.compile(
+    rf'{DISCOVERY_PREFIX}/switch/{NODE_ID}/(cam[1-9][0-9]*)/(config|state|availability)'
+)
 OFF_SUFFIX = '_OFF_'
 AVAILABILITY_TOPIC = f'{DISCOVERY_PREFIX}/{NODE_ID}/availability'
 DEVICE_INFO = {
@@ -33,6 +36,33 @@ DEVICE_INFO = {
 state_changed_event = threading.Event()
 device_lock = threading.Lock()
 mqtt_lock = threading.Lock()
+
+
+class DahuaMqttClient(mqtt.Client):
+    def __init__(self):
+        super().__init__(mqtt.CallbackAPIVersion.VERSION2)
+        # Serialize complete NVR snapshots, including command and reconnect paths.
+        self.update_lock = threading.RLock()
+        self.published_cameras = set()
+        self.current_cameras = None
+        self.discovery_pending = True
+
+
+def publish_retained(client, topic, payload):
+    with mqtt_lock:
+        result = client.publish(topic, payload, qos=1, retain=True)
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f'Could not publish {topic}: {mqtt.error_string(result.rc)}')
+
+
+def clear_camera(client, cam_name):
+    mqtt_prefix = f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/{cam_name}'
+    # Remember partial cleanup so a failed publication is retried on recovery.
+    client.published_cameras.add(cam_name)
+    for suffix in ('config', 'state', 'availability'):
+        publish_retained(client, f'{mqtt_prefix}/{suffix}', '')
+    client.published_cameras.discard(cam_name)
+    log.info('%s retained topics cleared', cam_name)
 
 
 def camera_reachable(cam):
@@ -85,6 +115,16 @@ def read_state(device: DahuaDevice):
 
 
 def publish_config(client: mqtt.Client, state):
+    with client.update_lock:
+        _publish_config(client, state)
+
+
+def _publish_config(client, state):
+    camera_names = {cam['_name'] for cam in state.values()}
+    client.discovery_pending = True
+    for cam_name in sorted(client.published_cameras - camera_names):
+        clear_camera(client, cam_name)
+
     for cam in state.values():
         cam_name = cam['_name']
         mqtt_prefix = f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/{cam_name}'
@@ -109,9 +149,18 @@ def publish_config(client: mqtt.Client, state):
         if ip:
             entity_config['device']['configuration_url'] = f'http://{ip}/'
 
-        with mqtt_lock:
-            client.publish(f'{mqtt_prefix}/config', json.dumps(entity_config), qos=1, retain=True)
+        client.published_cameras.add(cam_name)
+        publish_retained(client, f'{mqtt_prefix}/config', json.dumps(entity_config))
         log.info('%s config published', cam_name)
+
+    client.current_cameras = camera_names
+    client.discovery_pending = False
+
+
+def refresh_config(client, state, force=False):
+    camera_names = {cam['_name'] for cam in state.values()}
+    if force or client.discovery_pending or camera_names != client.current_cameras:
+        publish_config(client, state)
 
 
 def publish_state(client: mqtt.Client, state):
@@ -121,35 +170,63 @@ def publish_state(client: mqtt.Client, state):
 
         state_str = 'ON' if cam['_state'] else 'OFF'
 
-        with mqtt_lock:
-            client.publish(f'{mqtt_prefix}/state', state_str, qos=1, retain=True)
-            client.publish(f'{mqtt_prefix}/availability',
-                           'online' if cam['_available'] else 'offline', qos=1, retain=True)
+        publish_retained(client, f'{mqtt_prefix}/state', state_str)
+        publish_retained(client, f'{mqtt_prefix}/availability',
+                         'online' if cam['_available'] else 'offline')
         log.info('%s state published', cam_name)
 
 
 def publish_availability(client, available):
-    with mqtt_lock:
-        client.publish(AVAILABILITY_TOPIC, 'online' if available else 'offline', qos=1, retain=True)
+    with client.update_lock:
+        if available:
+            publish_retained(client, AVAILABILITY_TOPIC, 'online')
+        else:
+            # Keep the published inventory, but do not clean up from a stale snapshot.
+            client.current_cameras = None
+            client.discovery_pending = True
+            with mqtt_lock:
+                client.publish(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
 
 
 def on_connect(client: mqtt.Client, device: DahuaDevice, flags, reason_code, properties):
-    publish_availability(client, False)
-    try:
-        state = read_state(device)
-        publish_config(client, state)
-        publish_state(client, state)
-        publish_availability(client, True)
-    except Exception:
-        log.exception('Could not read initial NVR state; cameras remain unavailable')
-
-    # Renew subscriptions after every reconnect, including an initial NVR failure.
-    with mqtt_lock:
-        client.subscribe(f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/+/set')
+    with client.update_lock:
+        publish_availability(client, False)
+        # Also replay our retained topics to find cameras left by a previous process.
+        # Subscribe before publishing, including when the initial NVR read fails.
+        with mqtt_lock:
+            client.subscribe(f'{DISCOVERY_PREFIX}/switch/{NODE_ID}/+/+', qos=1)
+        try:
+            state = read_state(device)
+            publish_config(client, state)
+            publish_state(client, state)
+            publish_availability(client, True)
+        except Exception:
+            client.current_cameras = None
+            client.discovery_pending = True
+            log.exception('Could not read initial NVR state; cameras remain unavailable')
 
 
 def on_message(client: mqtt.Client, device: DahuaDevice, msg: mqtt.MQTTMessage):
-    match = SET_RE.match(msg.topic)
+    with client.update_lock:
+        match = CAMERA_TOPIC_RE.fullmatch(msg.topic)
+        if match:
+            cam_name, suffix = match.groups()
+            if msg.payload:
+                # Paho can replay older QoS 1 publications after on_connect.
+                # Their live echoes must not resurrect an already removed camera.
+                client.published_cameras.add(cam_name)
+                if client.current_cameras is not None and cam_name not in client.current_cameras:
+                    clear_camera(client, cam_name)
+            elif (suffix == 'config' and client.current_cameras is not None
+                  and cam_name in client.current_cameras):
+                # An old queued deletion can also arrive after a camera was re-added.
+                client.discovery_pending = True
+            return
+        _on_command(client, device, msg)
+
+
+def _on_command(client, device, msg):
+    match = SET_RE.fullmatch(msg.topic)
     if not match:
         log.error('Got invalid MQTT topic: %s', msg.topic)
         return
@@ -167,6 +244,7 @@ def on_message(client: mqtt.Client, device: DahuaDevice, msg: mqtt.MQTTMessage):
     channel0 = channel1 - 1
 
     state = read_state(device)
+    refresh_config(client, state)
     cam = state.get(channel0)
     if cam is None:
         log.warning('Ignoring command for unknown channel %s', channel1)
@@ -207,11 +285,13 @@ def on_message(client: mqtt.Client, device: DahuaDevice, msg: mqtt.MQTTMessage):
     state_changed_event.set()
 
 
-def on_message_protected(*args, **kwargs):
-    try:
-        return on_message(*args, **kwargs)
-    except Exception:
-        log.exception('Got error during message handling')
+def on_message_protected(client, device, msg):
+    with client.update_lock:
+        try:
+            return on_message(client, device, msg)
+        except Exception:
+            publish_availability(client, False)
+            log.exception('Got error during message handling')
 
 
 class UpdateThread(threading.Thread):
@@ -239,18 +319,22 @@ class UpdateThread(threading.Thread):
                 log.info('Refreshing state from NVR by timer')
 
             counter += 1
-            if self.client.is_connected():
-                try:
-                    state = read_state(self.device)
-                    publish_state(self.client, state)
-                    publish_availability(self.client, True)
-                    if counter % self.config_update_every == 0:
-                        # refresh config every 10th update
-                        log.info('Also refreshing device config')
-                        publish_config(self.client, state)
-                except Exception:
-                    publish_availability(self.client, False)
-                    log.exception('Got error while updating state')
+            with self.client.update_lock:
+                if self.client.is_connected():
+                    try:
+                        state = read_state(self.device)
+                        # Refresh immediately on recovery or inventory changes, and
+                        # keep the configured periodic refresh for metadata changes.
+                        refresh_config(self.client, state,
+                                       force=counter % self.config_update_every == 0)
+                        publish_state(self.client, state)
+                        publish_availability(self.client, True)
+                    except Exception:
+                        publish_availability(self.client, False)
+                        log.exception('Got error while updating state')
+                else:
+                    self.client.current_cameras = None
+                    self.client.discovery_pending = True
 
 
 def main():
@@ -275,7 +359,7 @@ def main():
         device.login(args.dahua_username, args.dahua_password)
 
     log.info('Connecting to MQTT server...')
-    mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqttc = DahuaMqttClient()
     mqttc.will_set(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
     with mqtt_lock:
         mqttc.user_data_set(device)
