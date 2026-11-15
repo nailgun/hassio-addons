@@ -255,21 +255,31 @@ def _on_command(client, device, msg):
         publish_state(client, state)
         return
 
-    username = cam['DeviceInfo']['UserName']
+    info = cam['DeviceInfo']
+    username = info['UserName']
     current_state = not username.endswith(OFF_SUFFIX)
 
     if new_state == current_state:
         publish_state(client, state)
         return
 
-    if new_state:
-        username = username.removesuffix(OFF_SUFFIX)
-    else:
-        username += OFF_SUFFIX
-    cam['DeviceInfo']['UserName'] = username
+    new_username = username.removesuffix(OFF_SUFFIX) if new_state else username + OFF_SUFFIX
+    info['UserName'] = new_username
+
+    if info.get('ProtocolType') == 'General':
+        # Some RTSP cameras authenticate via an explicit username in the URL path.
+        old_segment = f'/user={username}_password='
+        new_segment = f'/user={new_username}_password='
+        for video_input in info.get('VideoInputs') or []:
+            if not video_input:
+                continue
+            for field in ('MainStreamUrl', 'ExtraStreamUrl'):
+                url = video_input.get(field)
+                if url:
+                    video_input[field] = url.replace(old_segment, new_segment, 1)
 
     # unknown field added on `LogicDeviceManager.secSetCamera`
-    cam['DeviceInfo']['VideoInputChannels'] = None
+    info['VideoInputChannels'] = None
 
     with device_lock:
         device.secure_request('LogicDeviceManager.secSetCamera', {
