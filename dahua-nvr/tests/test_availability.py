@@ -105,6 +105,31 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(updated['DeviceInfo']['UserName'], 'admin')
         self.assertFalse(any(k.startswith('_') for k in updated))
 
+    def test_general_rtsp_camera_toggles_embedded_username(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                cam = camera(0, disabled=enabled)
+                info = cam['DeviceInfo']
+                old_user = info['UserName']
+                new_user = 'admin' if enabled else 'admin_OFF_'
+                stream = 'rtsp://192.0.2.1/user={}_password=example_channel=1_stream={}.sdp'
+                info.update(ProtocolType='General', VideoInputs=[{
+                    'MainStreamUrl': stream.format(old_user, 0),
+                    'ExtraStreamUrl': stream.format(old_user, 1),
+                }])
+                states = [{'channel': 0, 'connectionState': 'Connected'}]
+                nvr = device([cam], states)
+                msg = SimpleNamespace(topic='homeassistant/switch/dahua_nvr/cam1/set',
+                                      payload=b'ON' if enabled else b'OFF')
+                with patch.object(app, 'camera_reachable', return_value=True):
+                    app.on_message(mqtt_client(), nvr, msg)
+                method, params = nvr.secure_request.call_args.args
+                self.assertEqual(method, 'LogicDeviceManager.secSetCamera')
+                result = params['cameras'][0]['DeviceInfo']
+                self.assertEqual(result['UserName'], new_user)
+                self.assertEqual(result['VideoInputs'][0]['MainStreamUrl'], stream.format(new_user, 0))
+                self.assertEqual(result['VideoInputs'][0]['ExtraStreamUrl'], stream.format(new_user, 1))
+
     def test_nvr_failure_keeps_bridge_offline_and_subscription_active(self):
         client = mqtt_client()
         with patch.object(app, 'read_state', side_effect=OSError('NVR offline')):
