@@ -32,8 +32,11 @@ class Gauge:
         self.height = options['frame_height']
         self.one_bar = options['angle_at_one_bar']
         self.two_bars = options['angle_at_two_bars']
-        if not 10 <= self.two_bars - self.one_bar <= 180:
-            raise ValueError('Calibration angles must span 10 to 180 degrees')
+        night_one = options.get('night_angle_at_one_bar')
+        night_two = options.get('night_angle_at_two_bars')
+        if (night_one is None) != (night_two is None):
+            raise ValueError('Both night calibration angles are required')
+        self.night_calibration = (night_one, night_two) if night_one is not None else None
         cx = options['center_x']
         cy = options['center_y']
         if not (29 <= cx < self.width - 29 and 29 <= cy < self.height - 29):
@@ -41,8 +44,10 @@ class Gauge:
 
         lower = options.get('scan_from', -65.0)
         upper = options.get('scan_to', 165.0)
-        if not lower + 8 < self.one_bar < self.two_bars < upper - 8 or upper - lower > 270:
-            raise ValueError('Scan must cover the calibration angles with an 8-degree margin')
+        self.validate_calibration(self.one_bar, self.two_bars, lower, upper)
+        if self.night_calibration is not None:
+            self.validate_calibration(*self.night_calibration, lower, upper)
+        self.gauge_box = (int(cx) - 29, int(cy) - 29, int(cx) + 30, int(cy) + 30)
         self.angles = np.arange(lower, upper + 0.05, 0.1)
         radians = np.deg2rad(self.angles[:, None])
         radius = np.arange(10, 26, 0.5)
@@ -51,6 +56,13 @@ class Gauge:
         self.centerline = x, y
         self.left = x + 2.5 * dy, y - 2.5 * dx
         self.right = x - 2.5 * dy, y + 2.5 * dx
+
+    @staticmethod
+    def validate_calibration(one_bar, two_bars, lower, upper):
+        if not 10 <= two_bars - one_bar <= 180:
+            raise ValueError('Calibration angles must span 10 to 180 degrees')
+        if not lower + 8 < one_bar < two_bars < upper - 8 or upper - lower > 270:
+            raise ValueError('Scan must cover the calibration angles with an 8-degree margin')
 
     @staticmethod
     def sample(image, coordinates):
@@ -64,11 +76,17 @@ class Gauge:
             + u * v * image[j + 1, i + 1]
         )
 
-    def read_angle(self, frame):
+    def read_pressure(self, frame):
         with Image.open(io.BytesIO(frame)) as source:
             if source.size != (self.width, self.height):
                 return None
             gray = np.asarray(source.convert('L'), dtype=np.float32)
+            one_bar, two_bars = self.one_bar, self.two_bars
+            if self.night_calibration is not None:
+                # The camera encodes its infrared image in monochrome.
+                rgb = np.asarray(source.crop(self.gauge_box).convert('RGB'))
+                if np.all(rgb[:, :, :2] == rgb[:, :, 2:]):
+                    one_bar, two_bars = self.night_calibration
 
         center = self.sample(gray, self.centerline)
         left = self.sample(gray, self.left)
@@ -81,18 +99,13 @@ class Gauge:
             return None
         if angle - self.angles[0] < 4 or self.angles[-1] - angle < 4:
             return None
-        return float(angle)
+        return 1 + (round(float(angle), 10) - one_bar) / (two_bars - one_bar)
 
-    def pressure(self, angle):
-        if not self.one_bar <= angle <= self.two_bars:
-            return None
-        return 1 + (angle - self.one_bar) / (self.two_bars - self.one_bar)
-
-    def band(self, angle):
-        low_angle = (self.one_bar + self.two_bars) / 2
-        if angle < low_angle:
+    @staticmethod
+    def band(pressure):
+        if pressure < 1.5:
             return 'low'
-        if angle > self.two_bars:
+        if pressure > 2:
             return 'high'
         return 'normal'
 
@@ -201,23 +214,19 @@ def main():
                 stop.wait(1)
                 continue
             try:
-                angle = gauge.read_angle(get_frame(entity, token))
+                pressure = gauge.read_pressure(get_frame(entity, token))
             except (OSError, ValueError) as error:
                 LOGGER.warning('Camera frame unavailable: %s', error)
-                angle = None
+                pressure = None
 
-            band = band_confirmation.update(None if angle is None else gauge.band(angle))
-            if angle is not None:
+            band = band_confirmation.update(None if pressure is None else gauge.band(pressure))
+            if pressure is not None:
                 timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
                 client.publish(LAST_READING_TOPIC, timestamp, qos=1, retain=True)
             if band is not None:
                 client.publish(BAND_TOPIC, band, qos=0)
-            pressure = None if angle is None else gauge.pressure(angle)
             if pressure is None:
-                if angle is None:
-                    LOGGER.warning('No confident gauge reading')
-                else:
-                    LOGGER.info('Gauge outside numeric calibration (band: %s)', gauge.band(angle))
+                LOGGER.warning('No confident gauge reading')
                 client.publish(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
             else:
                 payload = f'{pressure:.2f}'
