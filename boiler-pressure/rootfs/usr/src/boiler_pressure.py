@@ -67,17 +67,19 @@ class Framing:
         templates = []
         for angle in self.rotations:
             rotated = reference.rotate(float(angle), resample=Image.Resampling.BILINEAR)
-            pixels = self.normalized_pixels(np.asarray(rotated, dtype=np.float32))
+            pixels = self.normalized_pixels(
+                np.asarray(rotated, dtype=np.float32), self.min_contrast if angle == 0 else 0,
+            )
             if pixels is None:
                 raise ValueError('Framing reference needs more contrast')
             templates.append(pixels)
         return np.stack(templates)
 
-    def normalized_pixels(self, crop):
+    def normalized_pixels(self, crop, min_contrast):
         pixels = crop[self.mask]
         pixels -= pixels.mean()
         norm = np.linalg.norm(pixels)
-        if norm <= self.min_contrast * np.sqrt(pixels.size):
+        if norm <= min_contrast * np.sqrt(pixels.size):
             return None
         return pixels / norm
 
@@ -89,7 +91,7 @@ class Framing:
             for ix, dx in enumerate(self.offsets):
                 x, y, r = self.x + dx, self.y + dy, self.radius
                 crop = gray[y - r:y + r + 1, x - r:x + r + 1]
-                pixels = self.normalized_pixels(crop)
+                pixels = self.normalized_pixels(crop, self.min_contrast)
                 if pixels is not None:
                     scores[iy, ix] = np.einsum('ij,j->i', templates, pixels)
 
@@ -103,12 +105,16 @@ class Framing:
             return False, None
         iy, ix, ir = peak
         nominal_rotation = len(self.rotations) // 2
-        zero_score = scores[self.search, self.search, nominal_rotation]
-        # Near the nominal pose, small changes in illumination can favor a
-        # neighboring rotation. Keep the calibrated coordinates in that case.
-        if ix == iy == self.search and abs(ir - nominal_rotation) <= 1:
-            if zero_score >= self.min_similarity and similarity - zero_score <= 0.025:
-                return True, None
+        zero_rotation = scores[iy, ix, nominal_rotation]
+        # Small lighting changes can favor a neighboring template. Do not
+        # rotate the scan when a translation-only match is almost as good.
+        translation_only = (
+            abs(ir - nominal_rotation) <= 1
+            and zero_rotation >= self.min_similarity
+            and similarity - zero_rotation <= self.min_separation
+        )
+        if translation_only and ix == iy == self.search:
+            return True, None
 
         # Close grid points describe the same peak. Only a competing pose
         # far enough away to affect the needle should make the match ambiguous.
@@ -120,9 +126,13 @@ class Framing:
         if similarity - scores[distinct].max() < self.min_separation:
             return False, None
 
+        if translation_only:
+            ir = nominal_rotation
         dy = self.offsets[iy] + self.refine(scores[iy-1:iy+2, ix, ir])
         dx = self.offsets[ix] + self.refine(scores[iy, ix-1:ix+2, ir])
-        rotation = self.rotations[ir] + self.refine(scores[iy, ix, ir-1:ir+2])
+        rotation = 0.0
+        if not translation_only:
+            rotation = self.rotations[ir] + self.refine(scores[iy, ix, ir-1:ir+2])
         if max(abs(dx), abs(dy)) > self.max_shift or abs(rotation) > self.max_rotation:
             return False, None
         return True, (dx, dy, rotation)
