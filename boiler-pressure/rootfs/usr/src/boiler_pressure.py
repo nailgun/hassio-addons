@@ -1,5 +1,7 @@
 """Publish the pressure read from an analog boiler gauge."""
 
+import base64
+import binascii
 import io
 import json
 import logging
@@ -21,7 +23,87 @@ AVAILABILITY_TOPIC = 'boiler_pressure/availability'
 DISCOVERY_TOPIC = 'homeassistant/sensor/boiler_pressure/config'
 BAND_TOPIC = 'boiler_pressure/band'
 LAST_READING_TOPIC = 'boiler_pressure/last_reading'
+FRAMING_TOPIC = 'boiler_pressure/camera_moved'
+FRAMING_DISCOVERY_TOPIC = 'homeassistant/binary_sensor/boiler_pressure_camera_moved/config'
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+
+class Framing:
+    radius = 48
+    search = 4
+    min_contrast = 6
+    min_similarity = 0.75
+
+    def __init__(self, day, night, cx, cy, width, height):
+        self.x = int(cx)
+        self.y = int(cy)
+        border = self.radius + self.search
+        if not (border <= self.x < width - border and border <= self.y < height - border):
+            raise ValueError('Gauge framing reference is too close to the frame edge')
+        y, x = np.ogrid[-self.radius:self.radius + 1, -self.radius:self.radius + 1]
+        distance = x * x + y * y
+        # Exclude the moving needle and compare the gauge rim and its surroundings.
+        self.mask = (26 ** 2 <= distance) & (distance <= self.radius ** 2)
+        self.day = self.decode(day)
+        self.night = self.decode(night)
+
+    def decode(self, encoded):
+        size = 2 * self.radius + 1
+        try:
+            if len(encoded) > 16000:
+                raise ValueError('Framing reference exceeds maximum size')
+            data = base64.b64decode(encoded, validate=True)
+            with Image.open(io.BytesIO(data), formats=('PNG',)) as image:
+                if image.size != (size, size):
+                    raise ValueError(f'Expected a {size} x {size} reference crop')
+                reference = image.convert('L')
+        except (binascii.Error, OSError) as error:
+            raise ValueError('Invalid base64 PNG framing reference') from error
+        center = self.normalized_pixels(np.asarray(reference, dtype=np.float32))
+        if center is None:
+            raise ValueError('Framing reference needs more contrast')
+        rotated = np.stack([
+            self.normalized_pixels(np.asarray(
+                reference.rotate(angle, resample=Image.Resampling.BILINEAR), dtype=np.float32,
+            ), min_contrast=0)
+            for angle in (-10, -6, -4, -2, 2, 4, 6, 10)
+        ])
+        return center, rotated
+
+    def normalized_pixels(self, crop, min_contrast=None):
+        if min_contrast is None:
+            min_contrast = self.min_contrast
+        pixels = crop[self.mask]
+        pixels -= pixels.mean()
+        norm = np.linalg.norm(pixels)
+        if norm <= min_contrast * np.sqrt(pixels.size):
+            return None
+        return pixels / norm
+
+    def sample(self, gray, dx=0, dy=0):
+        x = self.x + dx
+        y = self.y + dy
+        r = self.radius
+        return self.normalized_pixels(gray[y - r:y + r + 1, x - r:x + r + 1])
+
+    def aligned(self, gray, night):
+        reference, rotated = self.night if night else self.day
+        current = self.sample(gray)
+        if current is None:
+            return None
+        center = current @ reference
+        if center < self.min_similarity or np.max(rotated @ current) > center + 0.025:
+            return False
+        # One pixel of drift is tolerated. Check whether a further shift is
+        # clearly better, even when the unshifted score still looks plausible.
+        for dy in range(-self.search, self.search + 1):
+            for dx in range(-self.search, self.search + 1):
+                if max(abs(dx), abs(dy)) <= 1:
+                    continue
+                shifted = self.sample(gray, dx, dy)
+                if shifted is not None and shifted @ reference > center + 0.06:
+                    return False
+        return True
 
 
 class Gauge:
@@ -47,6 +129,11 @@ class Gauge:
         self.validate_calibration(self.one_bar, self.two_bars, lower, upper)
         if self.night_calibration is not None:
             self.validate_calibration(*self.night_calibration, lower, upper)
+        day_ref = options.get('framing_reference_day')
+        night_ref = options.get('framing_reference_night')
+        if bool(day_ref) != bool(night_ref):
+            raise ValueError('Both framing references are required')
+        self.framing = Framing(day_ref, night_ref, cx, cy, self.width, self.height) if day_ref else None
         self.gauge_box = (int(cx) - 29, int(cy) - 29, int(cx) + 30, int(cy) + 30)
         self.angles = np.arange(lower, upper + 0.05, 0.1)
         radians = np.deg2rad(self.angles[:, None])
@@ -76,17 +163,23 @@ class Gauge:
             + u * v * image[j + 1, i + 1]
         )
 
-    def read_pressure(self, frame):
+    def read_frame(self, frame):
         with Image.open(io.BytesIO(frame)) as source:
             if source.size != (self.width, self.height):
-                return None
+                return None, None
             gray = np.asarray(source.convert('L'), dtype=np.float32)
             one_bar, two_bars = self.one_bar, self.two_bars
-            if self.night_calibration is not None:
+            night = False
+            if self.night_calibration is not None or self.framing is not None:
                 # The camera encodes its infrared image in monochrome.
                 rgb = np.asarray(source.crop(self.gauge_box).convert('RGB'))
-                if np.all(rgb[:, :, :2] == rgb[:, :, 2:]):
-                    one_bar, two_bars = self.night_calibration
+                night = bool(np.all(rgb[:, :, :2] == rgb[:, :, 2:]))
+            if night and self.night_calibration is not None:
+                one_bar, two_bars = self.night_calibration
+
+        aligned = self.framing.aligned(gray, night) if self.framing is not None else None
+        if self.framing is not None and aligned is not True:
+            return None, aligned
 
         center = self.sample(gray, self.centerline)
         left = self.sample(gray, self.left)
@@ -96,10 +189,11 @@ class Gauge:
         angle = self.angles[best]
         alternatives = score[np.abs(self.angles - angle) > 8]
         if score[best] < 35 or score[best] - alternatives.max() < 18:
-            return None
+            return None, aligned
         if angle - self.angles[0] < 4 or self.angles[-1] - angle < 4:
-            return None
-        return 1 + (round(float(angle), 10) - one_bar) / (two_bars - one_bar)
+            return None, aligned
+        pressure = 1 + (round(float(angle), 10) - one_bar) / (two_bars - one_bar)
+        return pressure, aligned
 
     @staticmethod
     def band(pressure):
@@ -182,6 +276,7 @@ def main():
     options = json.loads(Path('/data/options.json').read_text())
     gauge = Gauge(options)
     band_confirmation = BandConfirmation()
+    framing_confirmation = BandConfirmation()
     entity = options['camera_entity']
     if not re.fullmatch(r'camera\.[a-z0-9_]+', entity):
         raise ValueError('camera_entity must be a Home Assistant camera entity ID')
@@ -201,6 +296,19 @@ def main():
             return
         client.publish(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
         client.publish(DISCOVERY_TOPIC, json.dumps(discovery(interval)), qos=1, retain=True)
+        framing_config = {
+            'name': 'Boiler pressure camera moved',
+            'unique_id': 'boiler_pressure_camera_moved',
+            'default_entity_id': 'binary_sensor.boiler_pressure_camera_moved',
+            'state_topic': FRAMING_TOPIC,
+            'device_class': 'problem',
+            'entity_category': 'diagnostic',
+            'expire_after': max(3 * interval, interval + 30),
+        }
+        client.publish(
+            FRAMING_DISCOVERY_TOPIC, json.dumps(framing_config) if gauge.framing else '',
+            qos=1, retain=True,
+        )
         for key, config in diagnostic_discoveries(interval).items():
             client.publish(f'homeassistant/sensor/{key}/config', json.dumps(config), qos=1, retain=True)
 
@@ -211,13 +319,21 @@ def main():
         while not stop.is_set():
             if not client.is_connected():
                 band_confirmation.update(None)
+                framing_confirmation.update(None)
                 stop.wait(1)
                 continue
             try:
-                pressure = gauge.read_pressure(get_frame(entity, token))
+                pressure, aligned = gauge.read_frame(get_frame(entity, token))
             except (OSError, ValueError) as error:
                 LOGGER.warning('Camera frame unavailable: %s', error)
-                pressure = None
+                pressure, aligned = None, None
+
+            framing_band = {True: 'normal', False: 'moved', None: None}[aligned]
+            framing_state = framing_confirmation.update(framing_band)
+            if framing_state is not None:
+                client.publish(FRAMING_TOPIC, 'ON' if framing_state == 'moved' else 'OFF', qos=1)
+            if aligned is False:
+                LOGGER.warning('Camera framing does not match its reference')
 
             band = band_confirmation.update(None if pressure is None else gauge.band(pressure))
             if pressure is not None:
