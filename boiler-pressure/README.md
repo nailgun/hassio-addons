@@ -39,10 +39,17 @@ python3 generate_framing_reference.py aligned-frame.jpg 1259.2 209.2
 
 Put the two outputs in `framing_reference_day` and `framing_reference_night`
 and restart the add-on. The guard is optional and requires both references
-when enabled. An unverified frame does not produce a pressure reading.
+when enabled. Existing references work without changes.
 
-A mismatch on three consecutive captures turns on
+The guard estimates the translation and rotation of the gauge rim against
+the matching reference, then reads the needle using the transformed sample
+coordinates. It can compensate for a confident match within 8 pixels on each
+axis and 6 degrees of in-plane rotation. How much movement can be compensated
+depends on the image and match confidence. Perspective changes are not
+corrected. An unverified frame does not produce a pressure reading.
+
+Three consecutive captures with an uncorrectable framing mismatch turn on
 `binary_sensor.boiler_pressure_camera_moved`. Use an automation that triggers on
-this sensor turning on to notify users. The first matching frame clears the
-problem. Inadequate contrast or a missing frame breaks the mismatch streak and
+this sensor turning on to notify users. The first confidently aligned frame
+clears the problem. Inadequate contrast or a missing frame breaks the mismatch streak and
 is handled by the existing reading freshness check.
