@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bashio
+
+set -euo pipefail
+
+export MQTT_HOST MQTT_PORT MQTT_USERNAME MQTT_PASSWORD
+MQTT_HOST=$(bashio::services mqtt host)
+MQTT_PORT=$(bashio::services mqtt port)
+MQTT_USERNAME=$(bashio::services mqtt username)
+MQTT_PASSWORD=$(bashio::services mqtt password)
+
+# shellcheck disable=SC2093
+exec python /usr/src/boiler_pressure.py
