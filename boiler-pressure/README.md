@@ -16,3 +16,11 @@ An unreadable, missing, or out-of-range image makes the sensor unavailable.
 The two decimal places are display resolution; accuracy depends on the camera,
 gauge calibration, and lighting. Home Assistant records history for the
 discovered `sensor.boiler_pressure` entity.
+
+The diagnostic entities `sensor.boiler_pressure_band` and
+`sensor.boiler_pressure_last_reading` support alerts. A confident needle
+angle lower than the 1.5 bar position or higher than the 2 bar marker
+must repeat on three consecutive captures to publish a low or high
+band. A confident out-of-calibration angle still updates the timestamp,
+even though the numeric sensor is unavailable. Configure the angular
+search bounds (`scan_from` and `scan_to`) to cover the readable scale.

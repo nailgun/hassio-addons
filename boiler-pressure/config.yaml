@@ -1,5 +1,5 @@
 name: Boiler Pressure
-version: '1.0.0'
+version: '1.1.0'
 slug: boiler-pressure
 description: Read a boiler pressure gauge from a Home Assistant camera
 url: https://github.com/nailgun/hassio-addons/tree/main/boiler-pressure
@@ -19,6 +19,8 @@ options:
   center_y: 209.2
   angle_at_one_bar: 7.14
   angle_at_two_bars: 61.88
+  scan_from: -65.0
+  scan_to: 165.0
 schema:
   camera_entity: str
   interval: int(15,3600)
@@ -28,3 +30,5 @@ schema:
   center_y: float(0,4096)
   angle_at_one_bar: float(-360,360)
   angle_at_two_bars: float(-360,360)
+  scan_from: float(-360,360)
+  scan_to: float(-360,360)
