@@ -30,9 +30,12 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 class Framing:
     radius = 48
-    search = 4
+    max_shift = 8
+    max_rotation = 6
+    search = max_shift + 1
     min_contrast = 6
     min_similarity = 0.75
+    min_separation = 0.025
 
     def __init__(self, day, night, cx, cy, width, height):
         self.x = int(cx)
@@ -44,6 +47,8 @@ class Framing:
         distance = x * x + y * y
         # Exclude the moving needle and compare the gauge rim and its surroundings.
         self.mask = (26 ** 2 <= distance) & (distance <= self.radius ** 2)
+        self.rotations = np.arange(-self.max_rotation - 1, self.max_rotation + 2)
+        self.offsets = np.arange(-self.search, self.search + 1)
         self.day = self.decode(day)
         self.night = self.decode(night)
 
@@ -59,20 +64,18 @@ class Framing:
                 reference = image.convert('L')
         except (binascii.Error, OSError) as error:
             raise ValueError('Invalid base64 PNG framing reference') from error
-        center = self.normalized_pixels(np.asarray(reference, dtype=np.float32))
-        if center is None:
-            raise ValueError('Framing reference needs more contrast')
-        rotated = np.stack([
-            self.normalized_pixels(np.asarray(
-                reference.rotate(angle, resample=Image.Resampling.BILINEAR), dtype=np.float32,
-            ), min_contrast=0)
-            for angle in (-10, -6, -4, -2, 2, 4, 6, 10)
-        ])
-        return center, rotated
+        templates = []
+        for angle in self.rotations:
+            rotated = reference.rotate(float(angle), resample=Image.Resampling.BILINEAR)
+            pixels = self.normalized_pixels(
+                np.asarray(rotated, dtype=np.float32), self.min_contrast if angle == 0 else 0,
+            )
+            if pixels is None:
+                raise ValueError('Framing reference needs more contrast')
+            templates.append(pixels)
+        return np.stack(templates)
 
-    def normalized_pixels(self, crop, min_contrast=None):
-        if min_contrast is None:
-            min_contrast = self.min_contrast
+    def normalized_pixels(self, crop, min_contrast):
         pixels = crop[self.mask]
         pixels -= pixels.mean()
         norm = np.linalg.norm(pixels)
@@ -80,30 +83,74 @@ class Framing:
             return None
         return pixels / norm
 
-    def sample(self, gray, dx=0, dy=0):
-        x = self.x + dx
-        y = self.y + dy
-        r = self.radius
-        return self.normalized_pixels(gray[y - r:y + r + 1, x - r:x + r + 1])
+    def locate(self, gray, night):
+        templates = self.night if night else self.day
+        width = len(self.offsets)
+        scores = np.full((width, width, len(self.rotations)), -1.0, dtype=np.float32)
+        for iy, dy in enumerate(self.offsets):
+            for ix, dx in enumerate(self.offsets):
+                x, y, r = self.x + dx, self.y + dy, self.radius
+                crop = gray[y - r:y + r + 1, x - r:x + r + 1]
+                pixels = self.normalized_pixels(crop, self.min_contrast)
+                if pixels is not None:
+                    scores[iy, ix] = np.einsum('ij,j->i', templates, pixels)
 
-    def aligned(self, gray, night):
-        reference, rotated = self.night if night else self.day
-        current = self.sample(gray)
-        if current is None:
-            return None
-        center = current @ reference
-        if center < self.min_similarity or np.max(rotated @ current) > center + 0.025:
-            return False
-        # One pixel of drift is tolerated. Check whether a further shift is
-        # clearly better, even when the unshifted score still looks plausible.
-        for dy in range(-self.search, self.search + 1):
-            for dx in range(-self.search, self.search + 1):
-                if max(abs(dx), abs(dy)) <= 1:
-                    continue
-                shifted = self.sample(gray, dx, dy)
-                if shifted is not None and shifted @ reference > center + 0.06:
-                    return False
-        return True
+        peak = np.unravel_index(scores.argmax(), scores.shape)
+        similarity = scores[peak]
+        if similarity == -1:
+            return None, None
+        if similarity < self.min_similarity:
+            return False, None
+        if any(index == 0 or index == size - 1 for index, size in zip(peak, scores.shape)):
+            return False, None
+        iy, ix, ir = peak
+        nominal_rotation = len(self.rotations) // 2
+        zero_rotation = scores[iy, ix, nominal_rotation]
+        # Small lighting changes can favor a neighboring template. Do not
+        # rotate the scan when a translation-only match is almost as good.
+        translation_only = (
+            abs(ir - nominal_rotation) <= 1
+            and zero_rotation >= self.min_similarity
+            and similarity - zero_rotation <= self.min_separation
+        )
+        if translation_only and ix == iy == self.search:
+            return True, None
+
+        # Close grid points describe the same peak. Only a competing pose
+        # far enough away to affect the needle should make the match ambiguous.
+        distinct = (
+            (np.abs(self.offsets - self.offsets[iy])[:, None, None] >= 3)
+            | (np.abs(self.offsets - self.offsets[ix])[None, :, None] >= 3)
+            | (np.abs(self.rotations - self.rotations[ir])[None, None, :] >= 4)
+        )
+        if similarity - scores[distinct].max() < self.min_separation:
+            return False, None
+
+        if translation_only:
+            ir = nominal_rotation
+        dy = self.offsets[iy] + self.refine(scores[iy-1:iy+2, ix, ir])
+        dx = self.offsets[ix] + self.refine(scores[iy, ix-1:ix+2, ir])
+        rotation = 0.0
+        if not translation_only:
+            rotation = self.rotations[ir] + self.refine(scores[iy, ix, ir-1:ir+2])
+        if max(abs(dx), abs(dy)) > self.max_shift or abs(rotation) > self.max_rotation:
+            return False, None
+        return True, (dx, dy, rotation)
+
+    @staticmethod
+    def refine(neighbors):
+        before, center, after = neighbors
+        curvature = before - 2 * center + after
+        if curvature >= 0 or min(before, after) == -1:
+            return 0.0
+        return float(np.clip(0.5 * (before - after) / curvature, -0.5, 0.5))
+
+    def transform(self, coordinates, pose):
+        dx, dy, degrees = pose
+        sine, cosine = np.sin(np.deg2rad(degrees)), np.cos(np.deg2rad(degrees))
+        x, y = coordinates
+        x, y = x - self.x, y - self.y
+        return self.x + dx + cosine * x + sine * y, self.y + dy - sine * x + cosine * y
 
 
 class Gauge:
@@ -177,13 +224,16 @@ class Gauge:
             if night and self.night_calibration is not None:
                 one_bar, two_bars = self.night_calibration
 
-        aligned = self.framing.aligned(gray, night) if self.framing is not None else None
-        if self.framing is not None and aligned is not True:
-            return None, aligned
+        coordinates = (self.centerline, self.left, self.right)
+        aligned = None
+        if self.framing is not None:
+            aligned, pose = self.framing.locate(gray, night)
+            if aligned is not True:
+                return None, aligned
+            if pose is not None:
+                coordinates = tuple(self.framing.transform(points, pose) for points in coordinates)
 
-        center = self.sample(gray, self.centerline)
-        left = self.sample(gray, self.left)
-        right = self.sample(gray, self.right)
+        center, left, right = (self.sample(gray, points) for points in coordinates)
         score = (np.minimum(left, right) - center).mean(axis=1)
         best = int(score.argmax())
         angle = self.angles[best]
