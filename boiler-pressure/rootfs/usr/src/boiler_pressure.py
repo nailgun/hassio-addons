@@ -39,8 +39,8 @@ class Gauge:
         if not (29 <= cx < self.width - 29 and 29 <= cy < self.height - 29):
             raise ValueError('Gauge center is too close to the frame edge')
 
-        lower = options['scan_from']
-        upper = options['scan_to']
+        lower = options.get('scan_from', -65.0)
+        upper = options.get('scan_to', 165.0)
         if not lower + 8 < self.one_bar < self.two_bars < upper - 8 or upper - lower > 270:
             raise ValueError('Scan must cover the calibration angles with an 8-degree margin')
         self.angles = np.arange(lower, upper + 0.05, 0.1)
@@ -141,7 +141,7 @@ def discovery(interval):
     }
 
 
-def diagnostic_discoveries():
+def diagnostic_discoveries(interval):
     return {
         'boiler_pressure_band': {
             'name': 'Boiler pressure band',
@@ -150,7 +150,7 @@ def diagnostic_discoveries():
             'device_class': 'enum',
             'options': ['low', 'normal', 'high'],
             'state_topic': BAND_TOPIC,
-            'expire_after': 300,
+            'expire_after': max(300, 3 * interval),
             'entity_category': 'diagnostic',
         },
         'boiler_pressure_last_reading': {
@@ -188,7 +188,7 @@ def main():
             return
         client.publish(AVAILABILITY_TOPIC, 'offline', qos=1, retain=True)
         client.publish(DISCOVERY_TOPIC, json.dumps(discovery(interval)), qos=1, retain=True)
-        for key, config in diagnostic_discoveries().items():
+        for key, config in diagnostic_discoveries(interval).items():
             client.publish(f'homeassistant/sensor/{key}/config', json.dumps(config), qos=1, retain=True)
 
     client.on_connect = on_connect
@@ -197,6 +197,7 @@ def main():
     try:
         while not stop.is_set():
             if not client.is_connected():
+                band_confirmation.update(None)
                 stop.wait(1)
                 continue
             try:
