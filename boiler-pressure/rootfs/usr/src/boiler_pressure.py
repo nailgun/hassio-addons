@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import hashlib
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import re
 import signal
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -163,7 +165,7 @@ class Gauge:
             + u * v * image[j + 1, i + 1]
         )
 
-    def read_frame(self, frame):
+    def read_frame(self, frame, *, enhance=False, check_framing=True):
         with Image.open(io.BytesIO(frame)) as source:
             if source.size != (self.width, self.height):
                 return None, None
@@ -177,9 +179,17 @@ class Gauge:
             if night and self.night_calibration is not None:
                 one_bar, two_bars = self.night_calibration
 
-        aligned = self.framing.aligned(gray, night) if self.framing is not None else None
-        if self.framing is not None and aligned is not True:
+        aligned = self.framing.aligned(gray, night) if self.framing is not None and check_framing else None
+        if self.framing is not None and check_framing and aligned is not True:
             return None, aligned
+
+        if enhance:
+            crop = gray[self.gauge_box[1]:self.gauge_box[3], self.gauge_box[0]:self.gauge_box[2]]
+            low, high = np.percentile(crop, (10, 90))
+            if high - low < 20:
+                return None, aligned
+            # Keep floating-point samples to avoid clipping the amplified signal.
+            gray = gray * min(3.0, max(1.0, 150.0 / (high - low)))
 
         center = self.sample(gray, self.centerline)
         left = self.sample(gray, self.left)
@@ -193,6 +203,41 @@ class Gauge:
         if angle - self.angles[0] < 4 or self.angles[-1] - angle < 4:
             return None, aligned
         pressure = 1 + (round(float(angle), 10) - one_bar) / (two_bars - one_bar)
+        return pressure, aligned
+
+    def read_burst(self, frames):
+        if len(frames) != 3 or len({hashlib.sha256(frame).digest() for frame in frames}) != 3:
+            return None, None
+        pixels = []
+        modes = []
+        candidates = []
+        for frame in frames:
+            pressure, aligned = self.read_frame(frame, enhance=True)
+            if self.framing is not None and aligned is not True:
+                return None, aligned
+            with Image.open(io.BytesIO(frame)) as image:
+                if image.size != (self.width, self.height):
+                    return None, None
+                rgb = np.asarray(image.crop(self.gauge_box).convert('RGB'))
+                modes.append(bool(np.all(rgb[:, :, :2] == rgb[:, :, 2:])))
+                pixels.append(np.asarray(image.convert('RGB'), dtype=np.uint8))
+            candidates.append(pressure)
+        if len(set(modes)) != 1:
+            return None, None
+
+        merged = Image.fromarray(np.median(pixels, axis=0).astype(np.uint8))
+        buffer = io.BytesIO()
+        merged.save(buffer, format='PNG')
+        # Every source frame has already passed the framing guard. Filtering
+        # changes texture, so compare the original images with the reference.
+        pressure, _ = self.read_frame(buffer.getvalue(), enhance=True, check_framing=False)
+        aligned = True if self.framing is not None else None
+        if pressure is None:
+            return None, aligned
+        # Require independent single-frame support for the combined measurement.
+        support = [p for p in candidates if p is not None and abs(p - pressure) <= 0.02]
+        if len(support) < 2 or max(support) - min(support) > 0.02:
+            return None, aligned
         return pressure, aligned
 
     @staticmethod
@@ -323,7 +368,24 @@ def main():
                 stop.wait(1)
                 continue
             try:
-                pressure, aligned = gauge.read_frame(get_frame(entity, token))
+                captured_at = time.monotonic()
+                frame = get_frame(entity, token)
+                pressure, aligned = gauge.read_frame(frame)
+                if pressure is None and aligned is True:
+                    frames = [frame]
+                    for _ in range(2):
+                        if stop.wait(2):
+                            break
+                        frames.append(get_frame(entity, token))
+                    if len(frames) == 3:
+                        # Prefer the newest direct measurement when it is readable.
+                        pressure, aligned = gauge.read_frame(frames[-1])
+                        if pressure is None and aligned is True:
+                            pressure, aligned = gauge.read_burst(frames)
+                            if pressure is not None:
+                                LOGGER.info('Twilight reading confirmed by three-frame burst')
+                    if time.monotonic() - captured_at > 20:
+                        pressure, aligned = None, None
             except (OSError, ValueError) as error:
                 LOGGER.warning('Camera frame unavailable: %s', error)
                 pressure, aligned = None, None

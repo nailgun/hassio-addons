@@ -46,3 +46,19 @@ A mismatch on three consecutive captures turns on
 this sensor turning on to notify users. The first matching frame clears the
 problem. Inadequate contrast or a missing frame breaks the mismatch streak and
 is handled by the existing reading freshness check.
+
+## Twilight retries
+
+When a frame passes the framing check but its needle is uncertain, the add-on
+requests two more frames with two-second waits. A readable newest frame is used
+directly. Otherwise, a pixel median of three distinct frames from the same
+day/night mode is tried with bounded linear contrast amplification.
+
+Every source frame must pass the framing guard. The combined result must have
+support from at least two individual enhanced frames within 0.02 bar, and those
+supporting readings must also agree within 0.02 bar. A burst taking over
+20 seconds is discarded. Only an accepted result advances the last-reading
+timestamp and pressure alert confirmation.
+
+The original detector handles all readable frames. Twilight retries require
+both framing references. Failed retries leave the pressure unavailable.

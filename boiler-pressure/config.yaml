@@ -1,5 +1,5 @@
 name: Boiler Pressure
-version: '1.3.0'
+version: '1.3.1'
 slug: boiler-pressure
 description: Read a boiler pressure gauge from a Home Assistant camera
 url: https://github.com/nailgun/hassio-addons/tree/main/boiler-pressure
