@@ -235,8 +235,8 @@ class Gauge:
         if pressure is None:
             return None, aligned
         # Require independent single-frame support for the combined measurement.
-        support = [p for p in candidates if p is not None and abs(p - pressure) <= 0.02]
-        if len(support) < 2 or max(support) - min(support) > 0.02:
+        support = sorted(p for p in candidates if p is not None and abs(p - pressure) <= 0.02)
+        if not any(b - a <= 0.02 for a, b in zip(support, support[1:])):
             return None, aligned
         return pressure, aligned
 
